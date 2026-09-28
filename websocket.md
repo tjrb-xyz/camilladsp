@@ -421,6 +421,26 @@ In [14]: print(ws.recv())
 {"SetConfig":{"result":"Ok"}}
 ```
 
+## Requiring a token
+Anything that can reach the websocket port can control CamillaDSP, and a web page in a browser
+on the same machine can reach `127.0.0.1`. To stop both, start CamillaDSP with a token:
+
+```
+camilladsp -p 1234 --token-file /path/to/token
+camilladsp -p 1234 --token-fd 3 3</path/to/token     # an inherited file descriptor
+```
+
+The file (or descriptor) holds the token; surrounding whitespace is ignored, and an empty or
+unreadable token stops CamillaDSP with an error. The token is never given on the command line or
+in the environment, where other processes could read it.
+
+With a token, a client must send it in the `X-Dsper-Token` header of the websocket handshake,
+or the handshake is refused with `401 Unauthorized`. A handshake that carries an `Origin`
+header (every browser sends one) is refused with `403 Forbidden`, with or without the token.
+Clients that are not browsers send no `Origin` and are unaffected.
+
+Without `--token-file` or `--token-fd`, nothing changes.
+
 ## Secure websocket, wss://
 By compiling with the optional feature `secure-websocket`,
 the websocket server also supports loading an identity from a .pfx file. 

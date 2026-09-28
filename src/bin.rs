@@ -752,6 +752,26 @@ fn main_process() -> i32 {
                 }),
         )
         .arg(
+            Arg::new("token_file")
+                .long("token-file")
+                .value_name("TOKEN_FILE")
+                .display_order(200)
+                .help("Require this token (read from the file) in the X-Dsper-Token header, and refuse handshakes with an Origin header")
+                .requires("port")
+                .conflicts_with("token_fd")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("token_fd")
+                .long("token-fd")
+                .value_name("FD")
+                .display_order(200)
+                .help("As --token-file, reading the token from an inherited file descriptor")
+                .requires("port")
+                .action(ArgAction::Set)
+                .value_parser(clap::value_parser!(i32)),
+        )
+        .arg(
             Arg::new("wait")
                 .short('w')
                 .long("wait")
@@ -1158,9 +1178,21 @@ fn main_process() -> i32 {
                 state_file_path: statefilename.clone(),
                 unsaved_state_change: unsaved_state_changes.clone(),
             };
+            let token = match socketserver::read_token(
+                matches.get_one::<String>("token_file").map(|x| x.as_str()),
+                matches.get_one::<i32>("token_fd").copied(),
+            ) {
+                Ok(t) => t,
+                Err(err) => {
+                    // No token means no engine: never serve without the one asked for.
+                    error!("{err}");
+                    return EXIT_BAD_CONFIG;
+                }
+            };
             let server_params = socketserver::ServerParameters {
                 port: serverport,
                 address: &serveraddress,
+                token,
                 #[cfg(feature = "secure-websocket")]
                 cert_file: matches.get_one::<String>("cert").map(|x| x.as_str()),
                 #[cfg(feature = "secure-websocket")]

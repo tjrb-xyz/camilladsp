@@ -33,7 +33,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::Message;
 use tungstenite::WebSocket;
-use tungstenite::accept;
+use tungstenite::accept_hdr;
+use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tungstenite::http::StatusCode;
 
 use crate::ProcessingState;
 use crate::Res;
@@ -71,6 +73,9 @@ pub struct LocalData {
 pub struct ServerParameters<'a> {
     pub address: &'a str,
     pub port: usize,
+    /// When set, a client must send it in the `X-Dsper-Token` header, and any
+    /// handshake carrying an `Origin` header (a web page) is refused.
+    pub token: Option<String>,
     #[cfg(feature = "secure-websocket")]
     pub cert_file: Option<&'a str>,
     #[cfg(feature = "secure-websocket")]
@@ -512,6 +517,7 @@ pub fn start_server(parameters: ServerParameters, shared_data: SharedData) {
     debug!("Start websocket server on {}:{}", address, parameters.port);
     #[cfg(feature = "secure-websocket")]
     let acceptor = make_acceptor(&parameters.cert_file, &parameters.cert_pass);
+    let token: Arc<Option<String>> = Arc::new(parameters.token.clone());
 
     thread::spawn(move || {
         let ws_result = TcpListener::bind(format!("{address}:{port}"));
@@ -546,21 +552,22 @@ pub fn start_server(parameters: ServerParameters, shared_data: SharedData) {
                 };
                 #[cfg(feature = "secure-websocket")]
                 let acceptor_inst = acceptor.clone();
+                let token_inst = token.clone();
 
                 #[cfg(feature = "secure-websocket")]
                 thread::spawn(move || match acceptor_inst {
                     None => {
-                        let websocket_res = accept_plain_stream(stream);
+                        let websocket_res = accept_plain_stream(stream, &token_inst);
                         handle_tcp(websocket_res, &shared_data_inst, local_data);
                     }
                     Some(acc) => {
-                        let websocket_res = accept_secure_stream(acc, stream);
+                        let websocket_res = accept_secure_stream(acc, stream, &token_inst);
                         handle_tls(websocket_res, &shared_data_inst, local_data);
                     }
                 });
                 #[cfg(not(feature = "secure-websocket"))]
                 thread::spawn(move || {
-                    let websocket_res = accept_plain_stream(stream);
+                    let websocket_res = accept_plain_stream(stream, &token_inst);
                     handle_tcp(websocket_res, &shared_data_inst, local_data);
                 });
             }
@@ -626,16 +633,89 @@ make_handler!(TlsStream<TcpStream>, handle_tls);
 fn accept_secure_stream(
     acceptor: Arc<TlsAcceptor>,
     stream: Result<TcpStream, std::io::Error>,
+    token: &Option<String>,
 ) -> Res<tungstenite::WebSocket<TlsStream<TcpStream>>> {
-    let ws = accept(acceptor.accept(stream?)?)?;
+    // The error keeps the callback, and errors here are 'static: it owns its token.
+    let token = token.clone();
+    let ws = accept_hdr(
+        acceptor.accept(stream?)?,
+        move |req: &Request, resp: Response| check_handshake(req, &token).map(|_| resp),
+    )?;
     Ok(ws)
 }
 
 fn accept_plain_stream(
     stream: Result<TcpStream, std::io::Error>,
+    token: &Option<String>,
 ) -> Res<tungstenite::WebSocket<TcpStream>> {
-    let ws = accept(stream?)?;
+    // The error keeps the callback, and errors here are 'static: it owns its token.
+    let token = token.clone();
+    let ws = accept_hdr(stream?, move |req: &Request, resp: Response| {
+        check_handshake(req, &token).map(|_| resp)
+    })?;
     Ok(ws)
+}
+
+/// With a token configured: no browser (a handshake with `Origin` is refused,
+/// so a web page can never drive the engine), and the token must match.
+fn check_handshake(req: &Request, token: &Option<String>) -> Result<(), ErrorResponse> {
+    let Some(token) = token else {
+        return Ok(());
+    };
+    let refuse = |status: StatusCode, why: &str| {
+        warn!("Refused websocket handshake: {why}");
+        let mut resp = ErrorResponse::new(Some(why.to_string()));
+        *resp.status_mut() = status;
+        resp
+    };
+    if req.headers().contains_key("origin") {
+        return Err(refuse(StatusCode::FORBIDDEN, "a handshake with Origin"));
+    }
+    let given = req
+        .headers()
+        .get("x-dsper-token")
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    if !same_secret(given, token.as_bytes()) {
+        return Err(refuse(StatusCode::UNAUTHORIZED, "missing or wrong token"));
+    }
+    Ok(())
+}
+
+/// Compares in time that depends only on the lengths, never on where they differ.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Reads the websocket token from a file (e.g. a systemd credential) or an
+/// inherited file descriptor; never from the command line or the environment,
+/// where other processes can read it. Surrounding whitespace is ignored.
+pub fn read_token(file: Option<&str>, fd: Option<i32>) -> Res<Option<String>> {
+    let raw = match (file, fd) {
+        (Some(path), _) => std::fs::read_to_string(path)
+            .map_err(|e| format!("Could not read token file {path}: {e}"))?,
+        #[cfg(unix)]
+        (None, Some(fd)) => {
+            use std::io::Read;
+            use std::os::unix::io::FromRawFd;
+            // SAFETY: the parent handed this descriptor to us for the token; it is
+            // read once and closed.
+            let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+            let mut s = String::new();
+            f.read_to_string(&mut s)
+                .map_err(|e| format!("Could not read token fd {fd}: {e}"))?;
+            s
+        }
+        _ => return Ok(None),
+    };
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        return Err("The websocket token is empty".into());
+    }
+    Ok(Some(token))
 }
 
 fn handle_command(
@@ -1890,5 +1970,50 @@ mod tests {
         let cmd = Message::text("{\"SetConfigFilePath\": \"somefile\"}");
         let res = parse_command(cmd).unwrap();
         assert_eq!(res, WsCommand::SetConfigFilePath("somefile".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::{check_handshake, same_secret};
+    use tungstenite::handshake::server::Request;
+
+    fn req(headers: &[(&str, &str)]) -> Request {
+        let mut b = Request::builder().uri("ws://127.0.0.1:1234/");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn without_a_token_everything_is_accepted_as_before() {
+        assert!(check_handshake(&req(&[("Origin", "https://x")]), &None).is_ok());
+    }
+
+    #[test]
+    fn with_a_token_only_the_token_without_origin_is_accepted() {
+        let t = Some("s3cret-token".to_string());
+        assert!(check_handshake(&req(&[("X-Dsper-Token", "s3cret-token")]), &t).is_ok());
+        let no = |h: &[(&str, &str)]| check_handshake(&req(h), &t).unwrap_err().status().as_u16();
+        assert_eq!(no(&[]), 401);
+        assert_eq!(no(&[("X-Dsper-Token", "s3cret-tokeN")]), 401);
+        assert_eq!(no(&[("X-Dsper-Token", "s3cret")]), 401);
+        assert_eq!(
+            no(&[
+                ("X-Dsper-Token", "s3cret-token"),
+                ("Origin", "http://127.0.0.1")
+            ]),
+            403,
+            "a web page never drives the engine, even with the token"
+        );
+    }
+
+    #[test]
+    fn secrets_compare_exactly() {
+        assert!(same_secret(b"abc", b"abc"));
+        assert!(!same_secret(b"abc", b"abd"));
+        assert!(!same_secret(b"abc", b"abcd"));
+        assert!(!same_secret(b"", b"a"));
     }
 }
